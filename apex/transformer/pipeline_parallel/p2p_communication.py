@@ -50,7 +50,8 @@ def _run_p2pops(
     tensor_send_next: Union[torch.Tensor, None],
     tensor_recv_prev: Union[torch.Tensor, None],
     tensor_recv_next: Union[torch.Tensor, None],
-    async_comm: bool = False
+    async_comm: bool = False,
+    overlap_p2p_comm: bool = False,
 ):
     ops = []
     p2p_group = parallel_state.get_pipeline_model_parallel_group()
@@ -95,18 +96,21 @@ def _run_p2pops(
             torch.cuda.synchronize()
 
         reqs = torch.distributed.batch_isend_irecv(ops)
-        if async_comm:
-            assert len(reqs) == len(ops)
-            tensor_send_prev_req = None if tensor_send_prev is None else reqs.pop(0)
-            tensor_recv_prev_req = None if tensor_recv_prev is None else reqs.pop(0)
-            tensor_send_next_req = None if tensor_send_next is None else reqs.pop(0)
-            tensor_recv_next_req = None if tensor_recv_next is None else reqs.pop(0)
-            return (tensor_send_prev_req, tensor_recv_prev_req, tensor_send_next_req, tensor_recv_next_req)
+        if overlap_p2p_comm:
+            return (None, None, None, None, reqs)
         else:
-            for req in reqs:
-                req.wait()
-            return (None, None, None, None)
-    return (None, None, None, None)
+            if async_comm:
+                assert len(reqs) == len(ops)
+                tensor_send_prev_req = None if tensor_send_prev is None else reqs.pop(0)
+                tensor_recv_prev_req = None if tensor_recv_prev is None else reqs.pop(0)
+                tensor_send_next_req = None if tensor_send_next is None else reqs.pop(0)
+                tensor_recv_next_req = None if tensor_recv_next is None else reqs.pop(0)
+                return (tensor_send_prev_req, tensor_recv_prev_req, tensor_send_next_req, tensor_recv_next_req, None)
+            else:
+                for req in reqs:
+                    req.wait()
+                return (None, None, None, None, None)
+    return (None, None, None, None, None)
 
 
 # TODO(mkozuki): Check if it's possible to sunset `override_scatter_gather_tensors_in_pipeline`.
@@ -129,6 +133,7 @@ def _communicate(
     async_comm: bool = False,
     sequence_parallel_enabled: bool = False,
     sync_batch_comm: bool = True,
+    overlap_p2p_comm: bool = False,
 ) -> Tuple[Union[torch.Tensor, FutureTensor, None], Union[torch.Tensor, FutureTensor, None]]:
     """Base function for communication of tensors between stages.
 
@@ -162,6 +167,9 @@ def _communicate(
             This argument has an effect on the communication optimization, not on tensor_shape update.
         sync_batch_comm: If :obj:`False`, disable cuda synchronization after the batched communication.
             To disable, https://github.com/pytorch/pytorch/pull/82450 would be required.
+        overlap_p2p_comm: If :obj:`True`, returns cuda wait handles to have the scheduler instead of completing
+            the communication within the p2p transfer API instance. The schedule manages the communication wait handling
+            to overlap the communication with compute kernels.
 
     Returns:
         tuple containing
@@ -252,7 +260,8 @@ def _communicate(
             tensor_send_prev = split_tensor_into_1d_equal_chunks(tensor_send_prev)
 
     # Send tensors in both the forward and backward directions as appropriate.
-    tensor_send_prev_req, tensor_recv_prev_req, tensor_send_next_req, tensor_recv_next_req = _run_p2pops(tensor_send_prev, tensor_send_next, tensor_recv_prev, tensor_recv_next, async_comm=async_comm)
+    tensor_send_prev_req, tensor_recv_prev_req, tensor_send_next_req, tensor_recv_next_req, wait_handles = _run_p2pops(
+        tensor_send_prev, tensor_send_next, tensor_recv_prev, tensor_recv_next, async_comm=async_comm, overlap_p2p_comm=overlap_p2p_comm)
 
     if async_comm:
         tensor_recv_prev_waitfunc = None
@@ -318,8 +327,8 @@ def _communicate(
             future_tensor_recv_prev = FutureTensor(tensor_recv_prev, tensor_recv_prev_waitfunc)
         if tensor_recv_next is not None:
             future_tensor_recv_next = FutureTensor(tensor_recv_next, tensor_recv_next_waitfunc)
-        return future_tensor_recv_prev, future_tensor_recv_next
-    return tensor_recv_prev, tensor_recv_next
+        return future_tensor_recv_prev, future_tensor_recv_next, None
+    return tensor_recv_prev, tensor_recv_next, wait_handles
 
 
 def recv_forward(
@@ -337,7 +346,7 @@ def recv_forward(
         return None
     # if timers is not None:
     #     timers("forward-recv").start()
-    input_tensor, _ = _communicate(
+    input_tensor, _, _ = _communicate(
         tensor_send_next=None,
         tensor_send_prev=None,
         recv_prev=True,
@@ -368,7 +377,7 @@ def recv_backward(
         return None
     # if timers is not None:
     #     timers("backward-recv").start()
-    _, output_tensor_grad = _communicate(
+    _, output_tensor_grad, _ = _communicate(
         tensor_send_next=None,
         tensor_send_prev=None,
         recv_prev=False,
@@ -461,7 +470,7 @@ def send_forward_recv_backward(
         return None
     # if timers is not None:
     #     timers("forward-send-backward-recv").start()
-    _, output_tensor_grad = _communicate(
+    _, output_tensor_grad, _ = _communicate(
         tensor_send_next=output_tensor,
         tensor_send_prev=None,
         recv_prev=False,
@@ -492,7 +501,7 @@ def send_backward_recv_forward(
         return None
     # if timers is not None:
     #     timers("backward-send-forward-recv").start()
-    input_tensor, _ = _communicate(
+    input_tensor, _, _ = _communicate(
         tensor_send_next=None,
         tensor_send_prev=input_tensor_grad,
         recv_prev=True,
@@ -517,12 +526,13 @@ def send_forward_recv_forward(
     async_comm: bool = False,
     sequence_parallel_enabled: bool = False,
     sync_batch_comm: bool = True,
+    overlap_p2p_comm: bool = False,
     timers: _Timers = None,
 ) -> Union[torch.Tensor, FutureTensor]:
     """Batched recv from previous rank and send to next rank in pipeline."""
     # if timers is not None:
     #     timers("forward-send-forward-recv").start()
-    input_tensor, _ = _communicate(
+    input_tensor, _, wait_handles = _communicate(
         tensor_send_next=output_tensor,
         tensor_send_prev=None,
         recv_prev=recv_prev,
@@ -532,9 +542,12 @@ def send_forward_recv_forward(
         async_comm=async_comm,
         sequence_parallel_enabled=sequence_parallel_enabled,
         sync_batch_comm=sync_batch_comm,
+        overlap_p2p_comm=overlap_p2p_comm,
     )
     # if timers is not None:
     #     timers("forward-send-forward-recv").stop()
+    if overlap_p2p_comm:
+        return input_tensor, wait_handles
     return input_tensor
 
 
@@ -547,12 +560,13 @@ def send_backward_recv_backward(
     async_comm: bool = False,
     sequence_parallel_enabled: bool = False,
     sync_batch_comm: bool = True,
+    overlap_p2p_comm: bool = False,
     timers: _Timers = None,
 ) -> Union[torch.Tensor, FutureTensor]:
     """Batched recv from next rank and send to previous rank in pipeline."""
     # if timers is not None:
     #     timers("backward-send-backward-recv").start()
-    _, output_tensor_grad = _communicate(
+    _, output_tensor_grad, wait_handles = _communicate(
         tensor_send_next=None,
         tensor_send_prev=input_tensor_grad,
         recv_prev=False,
@@ -562,9 +576,12 @@ def send_backward_recv_backward(
         async_comm=async_comm,
         sequence_parallel_enabled=sequence_parallel_enabled,
         sync_batch_comm=sync_batch_comm,
+        overlap_p2p_comm=overlap_p2p_comm,
     )
     # if timers is not None:
     #     timers("backward-send-backward-recv").stop()
+    if overlap_p2p_comm:
+        return output_tensor_grad, wait_handles
     return output_tensor_grad
 
 
@@ -579,12 +596,13 @@ def send_forward_backward_recv_forward_backward(
     async_comm: bool = False,
     sequence_parallel_enabled: bool = False,
     sync_batch_comm: bool = True,
+    overlap_p2p_comm: bool = False,
     timers: _Timers = None,
 ) -> Tuple[Union[torch.Tensor, FutureTensor], Union[torch.Tensor, FutureTensor]]:
     """Batched send and recv with previous and next ranks in pipeline."""
     # if timers is not None:
     #     timers("forward-backward-send-forward-backward-recv").start()
-    input_tensor, output_tensor_grad = _communicate(
+    input_tensor, output_tensor_grad, wait_handles = _communicate(
         tensor_send_next=output_tensor,
         tensor_send_prev=input_tensor_grad,
         recv_prev=recv_prev,
@@ -594,7 +612,10 @@ def send_forward_backward_recv_forward_backward(
         async_comm=async_comm,
         sequence_parallel_enabled=sequence_parallel_enabled,
         sync_batch_comm=sync_batch_comm,
+        overlap_p2p_comm=overlap_p2p_comm,
     )
     # if timers is not None:
     #     timers("forward-backward-send-forward-backward-recv").stop()
+    if overlap_p2p_comm:
+        return input_tensor, output_tensor_grad, wait_handles
     return input_tensor, output_tensor_grad
